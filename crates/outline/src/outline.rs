@@ -10,7 +10,7 @@ use fuzzy::StringMatch;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
     ParentElement, Point, Render, Styled, StyledText, Task, TextStyle, WeakEntity, Window, div,
-    rems,
+    rems, px,
 };
 use language::{Outline, OutlineItem};
 use ordered_float::OrderedFloat;
@@ -118,6 +118,8 @@ struct OutlineViewDelegate {
     outline_view: WeakEntity<OutlineView>,
     active_editor: Entity<Editor>,
     outline: Outline<Anchor>,
+    expanded: Vec<bool>,
+    has_children: Vec<bool>,
     selected_match_index: usize,
     prev_scroll_position: Option<Point<f32>>,
     matches: Vec<StringMatch>,
@@ -134,6 +136,13 @@ impl OutlineViewDelegate {
 
         cx: &mut Context<OutlineView>,
     ) -> Self {
+        let expanded = vec![true; outline.items.len()];
+        let mut has_children = vec![false; outline.items.len()];
+        for i in 0..outline.items.len() {
+            if i + 1 < outline.items.len() && outline.items[i + 1].depth > outline.items[i].depth {
+                has_children[i] = true;
+            }
+        }
         Self {
             outline_view,
             last_query: Default::default(),
@@ -142,6 +151,8 @@ impl OutlineViewDelegate {
             prev_scroll_position: Some(editor.update(cx, |editor, cx| editor.scroll_position(cx))),
             active_editor: editor,
             outline,
+            expanded,
+            has_children,
         }
     }
 
@@ -152,6 +163,31 @@ impl OutlineViewDelegate {
                 editor.set_scroll_position(scroll_position, window, cx);
             }
         })
+    }
+
+    fn visible_item_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        let mut skip_depth: Option<usize> = None;
+        for (i, item) in self.outline.items.iter().enumerate() {
+            if let Some(d) = skip_depth {
+                if item.depth > d {
+                    continue;
+                } else {
+                    skip_depth = None;
+                }
+            }
+            indices.push(i);
+            if !self.expanded[i] {
+                skip_depth = Some(item.depth);
+            }
+        }
+        indices
+    }
+
+    fn toggle_item(&mut self, id: usize) {
+        if let Some(expanded) = self.expanded.get_mut(id) {
+            *expanded = !*expanded;
+        }
     }
 
     fn set_selected_index(
@@ -217,12 +253,10 @@ impl PickerDelegate for OutlineViewDelegate {
         let selected_index;
         if query.is_empty() {
             self.restore_active_editor(window, cx);
-            self.matches = self
-                .outline
-                .items
+            let visible = self.visible_item_indices();
+            self.matches = visible
                 .iter()
-                .enumerate()
-                .map(|(index, _)| StringMatch {
+                .map(|&index| StringMatch {
                     candidate_id: index,
                     score: Default::default(),
                     positions: Default::default(),
@@ -235,12 +269,11 @@ impl PickerDelegate for OutlineViewDelegate {
                 let cursor_offset = editor.selections.newest::<usize>(cx).head();
                 (buffer, cursor_offset)
             });
-            selected_index = self
-                .outline
-                .items
+            selected_index = visible
                 .iter()
                 .enumerate()
-                .map(|(ix, item)| {
+                .map(|(visible_ix, &item_ix)| {
+                    let item = &self.outline.items[item_ix];
                     let range = item.range.to_offset(&buffer);
                     let distance_to_closest_endpoint = cmp::min(
                         (range.start as isize - cursor_offset as isize).abs(),
@@ -251,7 +284,7 @@ impl PickerDelegate for OutlineViewDelegate {
                     } else {
                         None
                     };
-                    (ix, depth, distance_to_closest_endpoint)
+                    (visible_ix, depth, distance_to_closest_endpoint)
                 })
                 .max_by_key(|(_, depth, distance)| (*depth, Reverse(*distance)))
                 .map(|(ix, _, _)| ix)
@@ -316,15 +349,29 @@ impl PickerDelegate for OutlineViewDelegate {
         let mat = self.matches.get(ix)?;
         let outline_item = self.outline.items.get(mat.candidate_id)?;
 
+        let has_children = self.has_children.get(mat.candidate_id).copied().unwrap_or(false);
+        let is_expanded = self.expanded.get(mat.candidate_id).copied().unwrap_or(true);
+
         Some(
             ListItem::new(ix)
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
+                .indent_level(outline_item.depth)
+                .indent_step_size(px(20.))
                 .toggle_state(selected)
+                .when(has_children && self.last_query.is_empty(), |item| {
+                    item.toggle(is_expanded).on_toggle(cx.listener({
+                        let id = mat.candidate_id;
+                        move |delegate, _event, window, cx| {
+                            delegate.toggle_item(id);
+                            // Update matches after toggling
+                            delegate.update_matches(String::new(), window, cx).detach();
+                        }
+                    }))
+                })
                 .child(
                     div()
                         .text_ui(cx)
-                        .pl(rems(outline_item.depth as f32))
                         .child(render_item(outline_item, mat.ranges(), cx)),
                 ),
         )
