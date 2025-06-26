@@ -8,9 +8,9 @@ use editor::RowHighlightOptions;
 use editor::{Anchor, AnchorRangeExt, Editor, scroll::Autoscroll};
 use fuzzy::StringMatch;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    ParentElement, Point, Render, Styled, StyledText, Task, TextStyle, WeakEntity, Window, div, px,
-    rems,
+    App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    HighlightStyle, ParentElement, Point, Render, Styled, StyledText, Task, TextStyle, WeakEntity,
+    Window, div, px, rems,
 };
 use language::{Outline, OutlineItem};
 use ordered_float::OrderedFloat;
