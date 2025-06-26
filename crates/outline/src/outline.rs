@@ -17,7 +17,7 @@ use ordered_float::OrderedFloat;
 use picker::{Picker, PickerDelegate};
 use settings::Settings;
 use theme::{ActiveTheme, ThemeSettings};
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{Disclosure, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt;
 use workspace::{DismissDecision, ModalView};
 
@@ -363,17 +363,18 @@ impl PickerDelegate for OutlineViewDelegate {
                 .indent_level(outline_item.depth)
                 .indent_step_size(px(20.))
                 .toggle_state(selected)
-                .when(has_children && self.last_query.is_empty(), |item| {
-                    item.toggle(is_expanded)
-                        .always_show_disclosure_icon(true)
-                        .on_toggle(cx.listener({
-                            let id = mat.candidate_id;
-                            move |picker, _event, window, cx| {
-                                picker.delegate.toggle_item(id);
-                                // Update matches after toggling
-                                picker.update_matches(String::new(), window, cx);
-                            }
-                        }))
+                .when(has_children, |item| {
+                    item.end_slot(
+                        Disclosure::new(("outline_toggle", ix as u64), is_expanded).on_toggle(
+                            cx.listener({
+                                let id = mat.candidate_id;
+                                move |picker, _event, window, cx| {
+                                    picker.delegate.toggle_item(id);
+                                    picker.update_matches(String::new(), window, cx);
+                                }
+                            }),
+                        ),
+                    )
                 })
                 .child(
                     div()
