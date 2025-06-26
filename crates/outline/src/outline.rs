@@ -364,14 +364,16 @@ impl PickerDelegate for OutlineViewDelegate {
                 .indent_step_size(px(20.))
                 .toggle_state(selected)
                 .when(has_children && self.last_query.is_empty(), |item| {
-                    item.toggle(is_expanded).on_toggle(cx.listener({
-                        let id = mat.candidate_id;
-                        move |picker, _event, window, cx| {
-                            picker.delegate.toggle_item(id);
-                            // Update matches after toggling
-                            picker.update_matches(String::new(), window, cx);
-                        }
-                    }))
+                    item.toggle(is_expanded)
+                        .always_show_disclosure_icon(true)
+                        .on_toggle(cx.listener({
+                            let id = mat.candidate_id;
+                            move |picker, _event, window, cx| {
+                                picker.delegate.toggle_item(id);
+                                // Update matches after toggling
+                                picker.update_matches(String::new(), window, cx);
+                            }
+                        }))
                 })
                 .child(
                     div()
