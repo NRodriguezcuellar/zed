@@ -34,6 +34,19 @@
         (variable_declarator
             name: (_) @name) @item))
 
+(statement_block
+    (lexical_declaration
+        ["let" "const"] @context
+        (variable_declarator
+            name: (_) @name) @item))
+
+(statement_block
+    (lexical_declaration
+        ["let" "const"] @context
+        (variable_declarator
+            name: (identifier) @name
+            value: [(function_expression) (arrow_function)]) @item))
+
 (class_declaration
     "class" @context
     name: (_) @name) @item
