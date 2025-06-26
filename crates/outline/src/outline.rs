@@ -9,8 +9,8 @@ use editor::{Anchor, AnchorRangeExt, Editor, scroll::Autoscroll};
 use fuzzy::StringMatch;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    ParentElement, Point, Render, Styled, StyledText, Task, TextStyle, WeakEntity, Window, div,
-    rems, px,
+    ParentElement, Point, Render, Styled, StyledText, Task, TextStyle, WeakEntity, Window, div, px,
+    rems,
 };
 use language::{Outline, OutlineItem};
 use ordered_float::OrderedFloat;
@@ -349,7 +349,11 @@ impl PickerDelegate for OutlineViewDelegate {
         let mat = self.matches.get(ix)?;
         let outline_item = self.outline.items.get(mat.candidate_id)?;
 
-        let has_children = self.has_children.get(mat.candidate_id).copied().unwrap_or(false);
+        let has_children = self
+            .has_children
+            .get(mat.candidate_id)
+            .copied()
+            .unwrap_or(false);
         let is_expanded = self.expanded.get(mat.candidate_id).copied().unwrap_or(true);
 
         Some(
@@ -362,10 +366,10 @@ impl PickerDelegate for OutlineViewDelegate {
                 .when(has_children && self.last_query.is_empty(), |item| {
                     item.toggle(is_expanded).on_toggle(cx.listener({
                         let id = mat.candidate_id;
-                        move |delegate, _event, window, cx| {
-                            delegate.toggle_item(id);
+                        move |picker, _event, window, cx| {
+                            picker.delegate.toggle_item(id);
                             // Update matches after toggling
-                            delegate.update_matches(String::new(), window, cx).detach();
+                            picker.update_matches(String::new(), window, cx);
                         }
                     }))
                 })
