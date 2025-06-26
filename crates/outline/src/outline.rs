@@ -364,17 +364,16 @@ impl PickerDelegate for OutlineViewDelegate {
                 .indent_step_size(px(20.))
                 .toggle_state(selected)
                 .when(has_children, |item| {
-                    item.end_slot(
-                        Disclosure::new(("outline_toggle", ix as u64), is_expanded).on_toggle(
-                            cx.listener({
-                                let id = mat.candidate_id;
-                                move |picker, _event, window, cx| {
-                                    picker.delegate.toggle_item(id);
-                                    picker.update_matches(String::new(), window, cx);
-                                }
-                            }),
-                        ),
-                    )
+                    item.end_slot({
+                        let id = mat.candidate_id;
+                        let handler: Option<Arc<dyn Fn(&ClickEvent, &mut Window, &mut App)>> =
+                            Some(Arc::new(cx.listener(move |picker, _event, window, cx| {
+                                picker.delegate.toggle_item(id);
+                                picker.update_matches(String::new(), window, cx);
+                            })));
+                        Disclosure::new(("outline_toggle", ix as u64), is_expanded)
+                            .on_toggle(handler)
+                    })
                 })
                 .child(
                     div()
