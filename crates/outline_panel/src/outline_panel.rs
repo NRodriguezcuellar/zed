@@ -112,6 +112,7 @@ pub struct OutlinePanel {
     reveal_selection_task: Task<anyhow::Result<()>>,
     outline_fetch_tasks: HashMap<(BufferId, ExcerptId), Task<()>>,
     excerpts: HashMap<BufferId, HashMap<ExcerptId, Excerpt>>,
+    outline_children_info: HashMap<BufferId, HashMap<ExcerptId, HashSet<Range<language::Anchor>>>>,
     cached_entries: Vec<CachedEntry>,
     filter_editor: Entity<Editor>,
     mode: ItemsDisplayMode,
@@ -307,12 +308,13 @@ struct CachedEntry {
     entry: PanelEntry,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CollapsedEntry {
     Dir(WorktreeId, ProjectEntryId),
     File(WorktreeId, BufferId),
     ExternalFile(BufferId),
     Excerpt(BufferId, ExcerptId),
+    Outline(BufferId, ExcerptId, Range<language::Anchor>),
 }
 
 #[derive(Debug)]
@@ -835,6 +837,7 @@ impl OutlinePanel {
                 reveal_selection_task: Task::ready(Ok(())),
                 outline_fetch_tasks: HashMap::default(),
                 excerpts: HashMap::default(),
+                outline_children_info: HashMap::default(),
                 cached_entries: Vec::new(),
                 _subscriptions: vec![
                     settings_subscription,
@@ -1372,40 +1375,69 @@ impl OutlinePanel {
     }
 
     fn is_unfoldable(&self, entry: &PanelEntry) -> bool {
-        matches!(entry, PanelEntry::FoldedDirs(..))
+        match entry {
+            PanelEntry::FoldedDirs(..) => true,
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) => {
+                self.collapsed_entries.contains(&CollapsedEntry::Outline(
+                    outline.buffer_id,
+                    outline.excerpt_id,
+                    outline.outline.range.clone(),
+                ))
+            }
+            _ => false,
+        }
     }
 
     fn is_foldable(&self, entry: &PanelEntry) -> bool {
-        let (directory_worktree, directory_entry) = match entry {
+        match entry {
             PanelEntry::Fs(FsEntry::Directory(FsEntryDirectory {
                 worktree_id,
                 entry: directory_entry,
                 ..
-            })) => (*worktree_id, Some(directory_entry)),
-            _ => return false,
-        };
-        let Some(directory_entry) = directory_entry else {
-            return false;
-        };
+            })) => {
+                let directory_worktree = *worktree_id;
+                let directory_entry = Some(directory_entry);
+                let Some(directory_entry) = directory_entry else {
+                    return false;
+                };
 
-        if self
-            .unfolded_dirs
-            .get(&directory_worktree)
-            .map_or(true, |unfolded_dirs| {
-                !unfolded_dirs.contains(&directory_entry.id)
-            })
-        {
-            return false;
+                if self
+                    .unfolded_dirs
+                    .get(&directory_worktree)
+                    .map_or(true, |unfolded_dirs| {
+                        !unfolded_dirs.contains(&directory_entry.id)
+                    })
+                {
+                    return false;
+                }
+
+                let children = self
+                    .fs_children_count
+                    .get(&directory_worktree)
+                    .and_then(|entries| entries.get(&directory_entry.path))
+                    .copied()
+                    .unwrap_or_default();
+
+                children.may_be_fold_part() && children.dirs > 0
+            }
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) => {
+                // Check if already collapsed
+                if self.collapsed_entries.contains(&CollapsedEntry::Outline(
+                    outline.buffer_id,
+                    outline.excerpt_id,
+                    outline.outline.range.clone(),
+                )) {
+                    return false;
+                }
+
+                // Check pre-calculated children info
+                self.outline_children_info
+                    .get(&outline.buffer_id)
+                    .and_then(|excerpt_info| excerpt_info.get(&outline.excerpt_id))
+                    .map_or(false, |children| children.contains(&outline.outline.range))
+            }
+            _ => false,
         }
-
-        let children = self
-            .fs_children_count
-            .get(&directory_worktree)
-            .and_then(|entries| entries.get(&directory_entry.path))
-            .copied()
-            .unwrap_or_default();
-
-        children.may_be_fold_part() && children.dirs > 0
     }
 
     fn expand_selected_entry(
@@ -1451,7 +1483,12 @@ impl OutlinePanel {
             PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
                 Some(CollapsedEntry::Excerpt(excerpt.buffer_id, excerpt.id))
             }
-            PanelEntry::Search(_) | PanelEntry::Outline(..) => return,
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) => Some(CollapsedEntry::Outline(
+                outline.buffer_id,
+                outline.excerpt_id,
+                outline.outline.range.clone(),
+            )),
+            PanelEntry::Search(_) => return,
         };
         let Some(collapsed_entry) = entry_to_expand else {
             return;
@@ -1554,7 +1591,14 @@ impl OutlinePanel {
             PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => self
                 .collapsed_entries
                 .insert(CollapsedEntry::Excerpt(excerpt.buffer_id, excerpt.id)),
-            PanelEntry::Search(_) | PanelEntry::Outline(..) => false,
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) => {
+                self.collapsed_entries.insert(CollapsedEntry::Outline(
+                    outline.buffer_id,
+                    outline.excerpt_id,
+                    outline.outline.range.clone(),
+                ))
+            }
+            PanelEntry::Search(_) => false,
         };
 
         if collapsed {
@@ -1769,7 +1813,17 @@ impl OutlinePanel {
                     self.collapsed_entries.insert(collapsed_entry);
                 }
             }
-            PanelEntry::Search(_) | PanelEntry::Outline(..) => return,
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) => {
+                let collapsed_entry = CollapsedEntry::Outline(
+                    outline.buffer_id,
+                    outline.excerpt_id,
+                    outline.outline.range.clone(),
+                );
+                if !self.collapsed_entries.remove(&collapsed_entry) {
+                    self.collapsed_entries.insert(collapsed_entry);
+                }
+            }
+            PanelEntry::Search(_) => return,
         }
 
         active_editor.update(cx, |editor, cx| {
@@ -2152,7 +2206,27 @@ impl OutlinePanel {
         let icon = if self.is_singleton_active(cx) {
             None
         } else {
-            Some(empty_icon())
+            // Check if this outline entry has children using pre-calculated info
+            let has_children = self
+                .outline_children_info
+                .get(&outline.buffer_id)
+                .and_then(|excerpt_info| excerpt_info.get(&outline.excerpt_id))
+                .map_or(false, |children| children.contains(&outline.outline.range));
+
+            if has_children {
+                // Check if it's currently collapsed
+                let is_collapsed = self.collapsed_entries.contains(&CollapsedEntry::Outline(
+                    outline.buffer_id,
+                    outline.excerpt_id,
+                    outline.outline.range.clone(),
+                ));
+                let is_expanded = !is_collapsed;
+                let color = entry_label_color(is_active);
+                FileIcons::get_chevron_icon(is_expanded, cx)
+                    .map(|icon_path| Icon::from_path(icon_path).color(color).into_any_element())
+            } else {
+                Some(empty_icon())
+            }
         };
 
         self.entry_element(
@@ -2989,6 +3063,7 @@ impl OutlinePanel {
         self.fs_entries_depth.clear();
         self.fs_children_count.clear();
         self.excerpts.clear();
+        self.outline_children_info.clear();
         self.cached_entries = Vec::new();
         self.selected_entry = SelectedEntry::None;
         self.pinned = false;
@@ -3436,11 +3511,13 @@ impl OutlinePanel {
             else {
                 return;
             };
-            let (new_cached_entries, max_width_item_index) = new_cached_entries.await;
+            let (new_cached_entries, max_width_item_index, new_outline_children_info) =
+                new_cached_entries.await;
             outline_panel
                 .update_in(cx, |outline_panel, window, cx| {
                     outline_panel.cached_entries = new_cached_entries;
                     outline_panel.max_width_item_index = max_width_item_index;
+                    outline_panel.outline_children_info = new_outline_children_info;
                     if outline_panel.selected_entry.is_invalidated()
                         || matches!(outline_panel.selected_entry, SelectedEntry::None)
                     {
@@ -3471,13 +3548,20 @@ impl OutlinePanel {
         query: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Task<(Vec<CachedEntry>, Option<usize>)> {
+    ) -> Task<(
+        Vec<CachedEntry>,
+        Option<usize>,
+        HashMap<BufferId, HashMap<ExcerptId, HashSet<Range<language::Anchor>>>>,
+    )> {
         let project = self.project.clone();
         let Some(active_editor) = self.active_editor() else {
-            return Task::ready((Vec::new(), None));
+            return Task::ready((Vec::new(), None, HashMap::default()));
         };
         cx.spawn_in(window, async move |outline_panel, cx| {
             let mut generation_state = GenerationState::default();
+            let mut outline_children_info =
+                HashMap::<BufferId, HashMap<ExcerptId, HashSet<Range<language::Anchor>>>>::default(
+                );
 
             let Ok(()) = outline_panel.update(cx, |outline_panel, cx| {
                 let auto_fold_dirs = OutlinePanelSettings::get_global(cx).auto_fold_dirs;
@@ -3755,6 +3839,7 @@ impl OutlinePanel {
                                 if !active_editor.read(cx).is_buffer_folded(buffer_id, cx) {
                                     outline_panel.add_excerpt_entries(
                                         &mut generation_state,
+                                        &mut outline_children_info,
                                         buffer_id,
                                         entry_excerpts,
                                         depth,
@@ -3806,7 +3891,7 @@ impl OutlinePanel {
                     }
                 }
             }) else {
-                return (Vec::new(), None);
+                return (Vec::new(), None, HashMap::default());
             };
 
             let Some(query) = query else {
@@ -3815,6 +3900,7 @@ impl OutlinePanel {
                     generation_state
                         .max_width_estimate_and_index
                         .map(|(_, index)| index),
+                    outline_children_info,
                 );
             };
 
@@ -3850,6 +3936,7 @@ impl OutlinePanel {
                 generation_state
                     .max_width_estimate_and_index
                     .map(|(_, index)| index),
+                outline_children_info,
             )
         })
     }
@@ -4074,6 +4161,10 @@ impl OutlinePanel {
     fn add_excerpt_entries(
         &self,
         state: &mut GenerationState,
+        outline_children_info: &mut HashMap<
+            BufferId,
+            HashMap<ExcerptId, HashSet<Range<language::Anchor>>>,
+        >,
         buffer_id: BufferId,
         entries_to_add: &[ExcerptId],
         parent_depth: usize,
@@ -4112,16 +4203,58 @@ impl OutlinePanel {
                     continue;
                 }
 
-                for outline in excerpt.iter_outlines() {
+                let mut collapsed_outline_depth = None;
+                let outline_list: Vec<_> = excerpt.iter_outlines().collect();
+                let excerpt_children_info = outline_children_info
+                    .entry(buffer_id)
+                    .or_default()
+                    .entry(excerpt_id)
+                    .or_default();
+
+                // Pre-calculate which outlines have children
+                for (i, outline) in outline_list.iter().enumerate() {
+                    if let Some(next_outline) = outline_list.get(i + 1) {
+                        if next_outline.depth > outline.depth {
+                            excerpt_children_info.insert(outline.range.clone());
+                        }
+                    }
+                }
+
+                for outline in outline_list {
+                    let outline_depth = outline_base_depth + outline.depth;
+
+                    // Check if this outline is a child of a collapsed outline
+                    if let Some(collapsed_depth) = collapsed_outline_depth {
+                        if outline_depth > collapsed_depth {
+                            continue; // Skip children of collapsed outline
+                        } else {
+                            collapsed_outline_depth = None; // Reset if we're back at same level or higher
+                        }
+                    }
+
+                    // Check if this outline is collapsed
+                    let outline_entry = OutlineEntryOutline {
+                        buffer_id,
+                        excerpt_id,
+                        outline: outline.clone(),
+                    };
+
+                    let is_collapsed = query.is_none()
+                        && self.collapsed_entries.contains(&CollapsedEntry::Outline(
+                            buffer_id,
+                            excerpt_id,
+                            outline.range.clone(),
+                        ));
+
+                    if is_collapsed {
+                        collapsed_outline_depth = Some(outline_depth);
+                    }
+
                     self.push_entry(
                         state,
                         track_matches,
-                        PanelEntry::Outline(OutlineEntry::Outline(OutlineEntryOutline {
-                            buffer_id,
-                            excerpt_id,
-                            outline: outline.clone(),
-                        })),
-                        outline_base_depth + outline.depth,
+                        PanelEntry::Outline(OutlineEntry::Outline(outline_entry)),
+                        outline_depth,
                         cx,
                     );
                 }
