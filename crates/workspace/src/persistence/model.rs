@@ -60,12 +60,25 @@ pub struct SessionWorkspace {
 }
 
 /// Per-window state for a MultiWorkspace, persisted to KVP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWorkspaceSession {
+    pub session_id: String,
+    pub title: String,
+    pub root_paths: Vec<String>,
+    pub workspace_id: WorkspaceId,
+    pub active_item_id: Option<u64>,
+    pub active_terminal_item_id: Option<u64>,
+    pub active_agent_thread_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MultiWorkspaceState {
     pub active_workspace_id: Option<WorkspaceId>,
     pub sidebar_open: bool,
     #[serde(default)]
     pub sidebar_state: Option<String>,
+    #[serde(default)]
+    pub sessions: Vec<StoredWorkspaceSession>,
 }
 
 /// The serialized state of a single MultiWorkspace window from a previous session:

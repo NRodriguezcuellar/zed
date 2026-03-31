@@ -26,6 +26,8 @@ const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
     Panel, Workspace, WorkspaceId, client_side_decorations,
+    persistence::model::StoredWorkspaceSession,
+    workspace_session::{WorkspaceSessionId, WorkspaceSessionState},
 };
 
 actions!(
@@ -222,6 +224,8 @@ pub struct MultiWorkspace {
     window_id: WindowId,
     workspaces: Vec<Entity<Workspace>>,
     active_workspace_index: usize,
+    sessions: Vec<WorkspaceSessionState>,
+    active_session_id: Option<WorkspaceSessionId>,
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
@@ -267,10 +271,18 @@ impl MultiWorkspace {
         workspace.update(cx, |workspace, cx| {
             workspace.set_multi_workspace(weak_self, cx);
         });
+        let mut sessions = Vec::new();
+        let mut active_session_id = None;
+        if let Some(session) = Self::build_session_state(&workspace, cx) {
+            active_session_id = Some(session.session_id.clone());
+            sessions.push(session);
+        }
         Self {
             window_id: window.window_handle().window_id(),
             workspaces: vec![workspace],
             active_workspace_index: 0,
+            sessions,
+            active_session_id,
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
@@ -458,6 +470,124 @@ impl MultiWorkspace {
         self.active_workspace_index
     }
 
+    pub fn sessions(&self) -> &[WorkspaceSessionState] {
+        &self.sessions
+    }
+
+    pub fn active_session_id(&self) -> Option<&WorkspaceSessionId> {
+        self.active_session_id.as_ref()
+    }
+
+    pub fn serialize_sessions(&self) -> Vec<StoredWorkspaceSession> {
+        self.sessions
+            .iter()
+            .map(|session| StoredWorkspaceSession {
+                session_id: session.session_id.0.clone(),
+                title: session.title.clone(),
+                root_paths: session
+                    .root_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                workspace_id: session.workspace_id,
+                active_item_id: session.active_item_id,
+                active_terminal_item_id: session.active_terminal_item_id,
+                active_agent_thread_id: session.active_agent_thread_id.clone(),
+            })
+            .collect()
+    }
+
+    pub fn restore_sessions(&mut self, sessions: Vec<StoredWorkspaceSession>) {
+        self.sessions = sessions
+            .into_iter()
+            .map(|session| WorkspaceSessionState {
+                session_id: WorkspaceSessionId(session.session_id),
+                title: session.title,
+                root_paths: session.root_paths.into_iter().map(Into::into).collect(),
+                workspace_id: session.workspace_id,
+                active_item_id: session.active_item_id,
+                active_terminal_item_id: session.active_terminal_item_id,
+                active_agent_thread_id: session.active_agent_thread_id,
+            })
+            .collect();
+    }
+
+    pub(crate) fn restore_session_state(
+        &mut self,
+        sessions: Vec<StoredWorkspaceSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sessions = self
+            .workspaces
+            .iter()
+            .filter_map(|workspace| {
+                let mut session = Self::build_session_state(workspace, cx)?;
+
+                if let Some(stored_session) = sessions
+                    .iter()
+                    .find(|stored_session| stored_session.workspace_id == session.workspace_id)
+                {
+                    session.session_id = WorkspaceSessionId(stored_session.session_id.clone());
+                    session.title = stored_session.title.clone();
+                    session.root_paths = stored_session
+                        .root_paths
+                        .iter()
+                        .cloned()
+                        .map(Into::into)
+                        .collect();
+                    session.active_item_id = stored_session.active_item_id;
+                    session.active_terminal_item_id = stored_session.active_terminal_item_id;
+                    session.active_agent_thread_id = stored_session.active_agent_thread_id.clone();
+                }
+
+                Some(session)
+            })
+            .collect();
+        self.active_session_id = self
+            .workspace()
+            .read(cx)
+            .database_id()
+            .and_then(|workspace_id| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.workspace_id == workspace_id)
+                    .map(|session| session.session_id.clone())
+            });
+        self.restore_active_session(window, cx);
+    }
+
+    pub fn activate_session(
+        &mut self,
+        session_id: &WorkspaceSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.capture_active_session(cx);
+
+        let Some(target_workspace_id) = self
+            .sessions
+            .iter()
+            .find(|session| &session.session_id == session_id)
+            .map(|session| session.workspace_id)
+        else {
+            return;
+        };
+
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.read(cx).database_id() == Some(target_workspace_id))
+            .cloned()
+        else {
+            return;
+        };
+
+        self.activate(workspace, window, cx);
+        self.active_session_id = Some(session_id.clone());
+        self.restore_active_session(window, cx);
+    }
+
     /// Adds a workspace to this window without changing which workspace is
     /// active.
     pub fn add(&mut self, workspace: Entity<Workspace>, window: &Window, cx: &mut Context<Self>) {
@@ -483,7 +613,11 @@ impl MultiWorkspace {
 
         let index = self.insert_workspace(workspace, &*window, cx);
         let changed = self.active_workspace_index != index;
+        if changed {
+            self.capture_active_session(cx);
+        }
         self.active_workspace_index = index;
+        self.sync_active_session_to_workspace(cx);
         if changed {
             cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
             self.serialize(cx);
@@ -507,7 +641,11 @@ impl MultiWorkspace {
 
         if let Some(index) = self.workspaces.iter().position(|w| *w == workspace) {
             let changed = self.active_workspace_index != index;
+            if changed {
+                self.capture_active_session(cx);
+            }
             self.active_workspace_index = index;
+            self.sync_active_session_to_workspace(cx);
             if changed {
                 cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
                 self.serialize(cx);
@@ -526,6 +664,12 @@ impl MultiWorkspace {
 
         Self::subscribe_to_workspace(&workspace, window, cx);
         self.sync_sidebar_to_workspace(&workspace, cx);
+        let weak_self = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_multi_workspace(weak_self, cx);
+        });
+        self.ensure_session_for_workspace(&workspace, cx);
+        self.sync_active_session_to_workspace(cx);
 
         cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(old_entity_id));
         cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace));
@@ -537,6 +681,7 @@ impl MultiWorkspace {
     fn set_single_workspace(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
         self.workspaces[0] = workspace;
         self.active_workspace_index = 0;
+        self.sync_active_session_to_workspace(cx);
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
         cx.notify();
     }
@@ -560,6 +705,7 @@ impl MultiWorkspace {
                 workspace.set_multi_workspace(weak_self, cx);
             });
             self.workspaces.push(workspace.clone());
+            self.ensure_session_for_workspace(&workspace, cx);
             cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace));
             cx.notify();
             self.workspaces.len() - 1
@@ -570,13 +716,24 @@ impl MultiWorkspace {
     /// removed or replaced. The DB row is preserved so the workspace still
     /// appears in the recent-projects list.
     fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        let workspace_id = workspace.read(cx).database_id();
         workspace.update(cx, |workspace, _cx| {
             workspace.session_id.take();
             workspace._schedule_serialize_workspace.take();
             workspace._serialize_workspace_task.take();
         });
 
-        if let Some(workspace_id) = workspace.read(cx).database_id() {
+        if let Some(workspace_id) = workspace_id {
+            self.sessions
+                .retain(|session| session.workspace_id != workspace_id);
+            if self.active_session_id.as_ref().is_some_and(|session_id| {
+                !self
+                    .sessions
+                    .iter()
+                    .any(|session| &session.session_id == session_id)
+            }) {
+                self.active_session_id = None;
+            }
             let db = crate::persistence::WorkspaceDb::global(cx);
             self.pending_removal_tasks.retain(|task| !task.is_ready());
             self.pending_removal_tasks
@@ -595,6 +752,117 @@ impl MultiWorkspace {
                 workspace.set_sidebar_focus_handle(sidebar_focus_handle);
             });
         }
+    }
+
+    fn build_session_state(
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> Option<WorkspaceSessionState> {
+        let workspace = workspace.read(cx);
+        let workspace_id = workspace.database_id()?;
+        let root_paths = workspace
+            .root_paths(cx)
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let title = root_paths
+            .first()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Workspace".to_string());
+        let mut session = WorkspaceSessionState::new(
+            WorkspaceSessionId(format!("workspace-{workspace_id:?}")),
+            title,
+            root_paths,
+            workspace_id,
+        );
+        Self::capture_workspace_session(&mut session, &workspace, cx);
+        Some(session)
+    }
+
+    fn capture_workspace_session(
+        session: &mut WorkspaceSessionState,
+        workspace: &Workspace,
+        cx: &App,
+    ) {
+        session.update_active_item(workspace.active_item_id_for_session(cx));
+        session.update_active_terminal(None);
+        session.update_active_agent_thread(None);
+    }
+
+    fn ensure_session_for_workspace(&mut self, workspace: &Entity<Workspace>, cx: &App) {
+        let Some(workspace_id) = workspace.read(cx).database_id() else {
+            return;
+        };
+
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.workspace_id == workspace_id)
+        {
+            let workspace = workspace.read(cx);
+            Self::capture_workspace_session(session, &workspace, cx);
+            return;
+        }
+
+        if let Some(session) = Self::build_session_state(workspace, cx) {
+            self.sessions.push(session);
+        }
+    }
+
+    fn sync_active_session_to_workspace(&mut self, cx: &App) {
+        let workspace = self.workspace().clone();
+        self.ensure_session_for_workspace(&workspace, cx);
+        self.active_session_id = workspace.read(cx).database_id().and_then(|workspace_id| {
+            self.sessions
+                .iter()
+                .find(|session| session.workspace_id == workspace_id)
+                .map(|session| session.session_id.clone())
+        });
+    }
+
+    fn capture_active_session(&mut self, cx: &App) {
+        let workspace = self.workspace().clone();
+        self.ensure_session_for_workspace(&workspace, cx);
+
+        let Some(workspace_id) = workspace.read(cx).database_id() else {
+            return;
+        };
+
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.workspace_id == workspace_id)
+        else {
+            return;
+        };
+
+        let workspace = workspace.read(cx);
+        Self::capture_workspace_session(session, &workspace, cx);
+    }
+
+    fn restore_active_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_session_id) = self.active_session_id.clone() else {
+            return;
+        };
+
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.session_id == active_session_id)
+        else {
+            return;
+        };
+
+        self.workspace().update(cx, |workspace, cx| {
+            if let Some(active_item_id) = session.active_item_id {
+                workspace.activate_session_item_by_id(active_item_id, window, cx);
+            }
+
+            if let Some(active_terminal_item_id) = session.active_terminal_item_id {
+                workspace.activate_session_item_by_id(active_terminal_item_id, window, cx);
+            }
+        });
     }
 
     fn cycle_workspace(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -622,6 +890,7 @@ impl MultiWorkspace {
     }
 
     pub(crate) fn serialize(&mut self, cx: &mut Context<Self>) {
+        self.capture_active_session(cx);
         self._serialize_task = Some(cx.spawn(async move |this, cx| {
             let Some((window_id, state)) = this
                 .read_with(cx, |this, cx| {
@@ -629,6 +898,7 @@ impl MultiWorkspace {
                         active_workspace_id: this.workspace().read(cx).database_id(),
                         sidebar_open: this.sidebar_open,
                         sidebar_state: this.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+                        sessions: this.serialize_sessions(),
                     };
                     (this.window_id, state)
                 })
@@ -767,6 +1037,7 @@ impl MultiWorkspace {
         self.workspace().update(cx, |workspace, _cx| {
             workspace.set_random_database_id();
         });
+        self.sync_active_session_to_workspace(cx);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -819,6 +1090,8 @@ impl MultiWorkspace {
                     workspace.update(cx, |workspace, _cx| {
                         workspace.set_database_id(workspace_id);
                     });
+                    this.ensure_session_for_workspace(&workspace, cx);
+                    this.sync_active_session_to_workspace(cx);
                     this.serialize(cx);
                     let db = db.clone();
                     cx.background_spawn(async move {
@@ -854,6 +1127,7 @@ impl MultiWorkspace {
         }
 
         self.detach_workspace(&removed_workspace, cx);
+        self.sync_active_session_to_workspace(cx);
 
         self.serialize(cx);
         self.focus_active_workspace(window, cx);

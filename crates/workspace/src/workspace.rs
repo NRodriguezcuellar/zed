@@ -8,6 +8,7 @@ mod multi_workspace;
 pub mod notifications;
 pub mod pane;
 pub mod pane_group;
+pub mod workspace_session;
 pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
@@ -3702,6 +3703,27 @@ impl Workspace {
 
     pub fn active_item(&self, cx: &App) -> Option<Box<dyn ItemHandle>> {
         self.active_pane().read(cx).active_item()
+    }
+
+    pub fn active_item_id_for_session(&self, cx: &App) -> Option<u64> {
+        self.active_item(cx).map(|item| item.item_id().as_u64())
+    }
+
+    pub fn activate_session_item_by_id(
+        &mut self,
+        item_id: u64,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(item) = self
+            .items(cx)
+            .find(|item| item.item_id().as_u64() == item_id)
+            .cloned()
+        else {
+            return false;
+        };
+
+        self.activate_item(item.as_ref(), true, true, window, cx)
     }
 
     pub fn active_item_as<I: 'static>(&self, cx: &App) -> Option<Entity<I>> {
@@ -8613,6 +8635,7 @@ pub async fn restore_multiworkspace(
     cx: &mut AsyncApp,
 ) -> anyhow::Result<MultiWorkspaceRestoreResult> {
     let SerializedMultiWorkspace { workspaces, state } = multi_workspace;
+    let restored_sessions = state.sessions.clone();
     let mut group_iter = workspaces.into_iter();
     let first = group_iter
         .next()
@@ -8684,6 +8707,7 @@ pub async fn restore_multiworkspace(
                 if let Some(workspace) = multi_workspace.workspaces().get(index).cloned() {
                     multi_workspace.activate(workspace, window, cx);
                 }
+                multi_workspace.restore_session_state(restored_sessions.clone(), window, cx);
             })
             .ok();
     } else {
@@ -8692,6 +8716,7 @@ pub async fn restore_multiworkspace(
                 if let Some(workspace) = multi_workspace.workspaces().first().cloned() {
                     multi_workspace.activate(workspace, window, cx);
                 }
+                multi_workspace.restore_session_state(restored_sessions.clone(), window, cx);
             })
             .ok();
     }

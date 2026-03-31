@@ -14,6 +14,10 @@ use project::AgentId;
 use settings::SettingsStore;
 use std::{path::PathBuf, sync::Arc};
 use util::path_list::PathList;
+use workspace::{
+    ItemHandle,
+    item::test::{TestItem, TestProjectItem},
+};
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -260,6 +264,27 @@ fn visible_entries_as_strings(
                         };
                         format!("  [+ New Thread{}]{}", worktree, selected)
                     }
+                }
+            })
+            .collect()
+    })
+}
+
+fn session_switcher_entries_as_strings(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<String> {
+    sidebar.read_with(cx, |sidebar, cx| {
+        sidebar
+            .session_switcher
+            .read(cx)
+            .entries_for_tests(cx)
+            .into_iter()
+            .map(|(title, is_active)| {
+                if is_active {
+                    format!("{title} [active]")
+                } else {
+                    title
                 }
             })
             .collect()
@@ -1487,6 +1512,176 @@ async fn test_escape_clears_search_and_restores_full_list(cx: &mut TestAppContex
             "  Beta thread",
         ]
     );
+}
+
+#[gpui::test]
+async fn test_session_switcher_tracks_multiple_workspaces(cx: &mut TestAppContext) {
+    let project_a = init_test_project("/project-a", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    multi_workspace.update(cx, |mw, cx| {
+        mw.set_random_database_id(cx);
+    });
+
+    let first_session_id = multi_workspace.read_with(cx, |mw, _cx| {
+        assert_eq!(mw.sessions().len(), 1);
+        mw.active_session_id()
+            .cloned()
+            .expect("missing active session")
+    });
+
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    open_and_focus_sidebar(&sidebar, cx);
+
+    assert_eq!(
+        session_switcher_entries_as_strings(&sidebar, cx),
+        vec!["project-a [active]"],
+    );
+
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.create_test_workspace(window, cx).detach();
+    });
+    cx.run_until_parked();
+
+    let second_session_id = multi_workspace.read_with(cx, |mw, _cx| {
+        assert_eq!(mw.sessions().len(), 2);
+        assert_eq!(mw.active_workspace_index(), 1);
+        mw.active_session_id()
+            .cloned()
+            .expect("missing active session")
+    });
+    assert_ne!(first_session_id, second_session_id);
+
+    assert_eq!(
+        session_switcher_entries_as_strings(&sidebar, cx),
+        vec!["project-a", "Workspace [active]"],
+    );
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.session_switcher.update(cx, |session_switcher, cx| {
+            session_switcher.activate_session(first_session_id.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |mw, _cx| {
+        assert_eq!(mw.sessions().len(), 2);
+        assert_eq!(mw.active_workspace_index(), 0);
+        assert_eq!(mw.active_session_id(), Some(&first_session_id));
+    });
+
+    assert_eq!(
+        session_switcher_entries_as_strings(&sidebar, cx),
+        vec!["project-a [active]", "Workspace"],
+    );
+}
+
+#[gpui::test]
+async fn test_switching_sessions_restores_the_last_active_context(cx: &mut TestAppContext) {
+    let project_a = init_test_project("/project-a", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    multi_workspace.update(cx, |mw, cx| {
+        mw.set_random_database_id(cx);
+    });
+
+    let first_workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspaces()[0].clone());
+    let first_session_id = multi_workspace.read_with(cx, |mw, _cx| {
+        mw.active_session_id()
+            .cloned()
+            .expect("missing first active session")
+    });
+
+    let first_item = cx.new(|cx| {
+        TestItem::new(cx).with_project_items(&[TestProjectItem::new(1, "first-a.txt", cx)])
+    });
+    let restored_first_item = cx.new(|cx| {
+        TestItem::new(cx).with_project_items(&[TestProjectItem::new(2, "first-b.txt", cx)])
+    });
+
+    first_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(first_item.clone()), None, false, window, cx);
+        workspace.add_item_to_active_pane(
+            Box::new(restored_first_item.clone()),
+            None,
+            true,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.create_test_workspace(window, cx).detach();
+    });
+    cx.run_until_parked();
+
+    let second_workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspaces()[1].clone());
+    let second_session_id = multi_workspace.read_with(cx, |mw, _cx| {
+        assert_eq!(mw.sessions().len(), 2);
+        mw.active_session_id()
+            .cloned()
+            .expect("missing second active session")
+    });
+
+    let second_item = cx.new(|cx| {
+        TestItem::new(cx).with_project_items(&[TestProjectItem::new(3, "second-a.txt", cx)])
+    });
+    let restored_second_item = cx.new(|cx| {
+        TestItem::new(cx).with_project_items(&[TestProjectItem::new(4, "second-b.txt", cx)])
+    });
+
+    second_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(second_item.clone()), None, false, window, cx);
+        workspace.add_item_to_active_pane(
+            Box::new(restored_second_item.clone()),
+            None,
+            true,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.session_switcher.update(cx, |session_switcher, cx| {
+            session_switcher.activate_session(first_session_id.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |mw, _cx| {
+        assert_eq!(mw.active_workspace_index(), 0);
+        assert_eq!(mw.active_session_id(), Some(&first_session_id));
+    });
+    first_workspace.read_with(cx, |workspace, cx| {
+        let active_item = workspace
+            .active_item(cx)
+            .expect("missing restored first item");
+        assert_eq!(active_item.item_id(), restored_first_item.item_id());
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.session_switcher.update(cx, |session_switcher, cx| {
+            session_switcher.activate_session(second_session_id.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |mw, _cx| {
+        assert_eq!(mw.active_workspace_index(), 1);
+        assert_eq!(mw.active_session_id(), Some(&second_session_id));
+    });
+    second_workspace.read_with(cx, |workspace, cx| {
+        let active_item = workspace
+            .active_item(cx)
+            .expect("missing restored second item");
+        assert_eq!(active_item.item_id(), restored_second_item.item_id());
+    });
 }
 
 #[gpui::test]

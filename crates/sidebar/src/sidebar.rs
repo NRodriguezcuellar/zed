@@ -1,3 +1,4 @@
+mod session_switcher;
 mod thread_switcher;
 
 use acp_thread::ThreadStatus;
@@ -52,6 +53,7 @@ use zed_actions::editor::{MoveDown, MoveUp};
 
 use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
 
+use crate::session_switcher::SessionSwitcher;
 use crate::thread_switcher::{ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent};
 
 use crate::project_group_builder::ProjectGroupBuilder;
@@ -355,6 +357,7 @@ pub struct Sidebar {
     width: Pixels,
     focus_handle: FocusHandle,
     filter_editor: Entity<Editor>,
+    session_switcher: Entity<SessionSwitcher>,
     list_state: ListState,
     contents: SidebarContents,
     /// The index of the list item that currently has the keyboard focus
@@ -399,6 +402,7 @@ impl Sidebar {
             editor.set_placeholder_text("Search…", window, cx);
             editor
         });
+        let session_switcher = cx.new(|cx| SessionSwitcher::new(multi_workspace.clone(), cx));
 
         cx.subscribe_in(
             &multi_workspace,
@@ -456,6 +460,7 @@ impl Sidebar {
             width: DEFAULT_WIDTH,
             focus_handle,
             filter_editor,
+            session_switcher,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
             contents: SidebarContents::default(),
             selection: None,
@@ -3676,6 +3681,7 @@ impl Render for Sidebar {
                         } else {
                             this.child(
                                 v_flex()
+                                    .child(self.session_switcher.clone())
                                     .relative()
                                     .flex_1()
                                     .overflow_hidden()

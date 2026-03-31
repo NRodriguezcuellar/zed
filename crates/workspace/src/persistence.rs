@@ -2474,7 +2474,8 @@ pub fn delete_unloaded_items(
 mod tests {
     use super::*;
     use crate::persistence::model::{
-        SerializedItem, SerializedPane, SerializedPaneGroup, SerializedWorkspace, SessionWorkspace,
+        MultiWorkspaceState, SerializedItem, SerializedPane, SerializedPaneGroup,
+        SerializedWorkspace, SessionWorkspace, StoredWorkspaceSession,
     };
     use gpui;
     use pretty_assertions::assert_eq;
@@ -3965,8 +3966,6 @@ mod tests {
 
     #[gpui::test]
     async fn test_read_serialized_multi_workspaces_with_state(cx: &mut gpui::TestAppContext) {
-        use crate::persistence::model::MultiWorkspaceState;
-
         // Write multi-workspace state for two windows via the scoped KVP.
         let window_10 = WindowId::from(10u64);
         let window_20 = WindowId::from(20u64);
@@ -3980,6 +3979,7 @@ mod tests {
                 active_workspace_id: Some(WorkspaceId(2)),
                 sidebar_open: true,
                 sidebar_state: None,
+                sessions: Vec::new(),
             },
         )
         .await;
@@ -3991,6 +3991,7 @@ mod tests {
                 active_workspace_id: Some(WorkspaceId(3)),
                 sidebar_open: false,
                 sidebar_state: None,
+                sessions: Vec::new(),
             },
         )
         .await;
@@ -4045,6 +4046,46 @@ mod tests {
         assert_eq!(group_none.workspaces.len(), 1);
         assert_eq!(group_none.state.active_workspace_id, None);
         assert_eq!(group_none.state.sidebar_open, false);
+    }
+
+    #[test]
+    fn multi_workspace_state_round_trips_sessions() {
+        let state = MultiWorkspaceState {
+            sidebar_open: true,
+            sidebar_state: Some("sidebar".into()),
+            active_workspace_id: Some(WorkspaceId::from_i64(7)),
+            sessions: vec![StoredWorkspaceSession {
+                session_id: "workspace-7".into(),
+                title: "zed".into(),
+                root_paths: vec!["/tmp/zed".into()],
+                workspace_id: WorkspaceId::from_i64(7),
+                active_item_id: Some(11),
+                active_terminal_item_id: Some(13),
+                active_agent_thread_id: Some("thread-1".into()),
+            }],
+        };
+
+        let json = match serde_json::to_string(&state) {
+            Ok(json) => json,
+            Err(error) => panic!("failed to serialize multi workspace state: {error}"),
+        };
+        let restored: MultiWorkspaceState = match serde_json::from_str(&json) {
+            Ok(restored) => restored,
+            Err(error) => panic!("failed to deserialize multi workspace state: {error}"),
+        };
+
+        assert_eq!(restored.sessions.len(), 1);
+        let restored_session = &restored.sessions[0];
+        assert_eq!(restored_session.session_id, "workspace-7");
+        assert_eq!(restored_session.title, "zed");
+        assert_eq!(restored_session.root_paths, vec!["/tmp/zed"]);
+        assert_eq!(restored_session.workspace_id, WorkspaceId::from_i64(7));
+        assert_eq!(restored_session.active_item_id, Some(11));
+        assert_eq!(restored_session.active_terminal_item_id, Some(13));
+        assert_eq!(
+            restored_session.active_agent_thread_id.as_deref(),
+            Some("thread-1")
+        );
     }
 
     #[gpui::test]
